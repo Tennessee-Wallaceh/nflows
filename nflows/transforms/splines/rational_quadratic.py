@@ -5,8 +5,8 @@ from torch.nn import functional as F
 from nflows.transforms.base import InputOutsideDomain
 from nflows.utils import torchutils
 
-DEFAULT_MIN_BIN_WIDTH = 1e-3
-DEFAULT_MIN_BIN_HEIGHT = 1e-3
+DEFAULT_MIN_BIN_WIDTH = 1e-4
+DEFAULT_MIN_BIN_HEIGHT = 1e-4
 DEFAULT_MIN_DERIVATIVE = 1e-3
 
 
@@ -17,52 +17,51 @@ def unconstrained_rational_quadratic_spline(
     unnormalized_derivatives,
     inverse=False,
     tails="linear",
-    tail_bound=1.0,
+    left_tail_bound=-1.0,
+    right_tail_bound=1.0,
     min_bin_width=DEFAULT_MIN_BIN_WIDTH,
     min_bin_height=DEFAULT_MIN_BIN_HEIGHT,
     min_derivative=DEFAULT_MIN_DERIVATIVE,
     enable_identity_init=False,
 ):
-    inside_interval_mask = (inputs >= -tail_bound) & (inputs <= tail_bound)
+    inside_interval_mask = (inputs >= left_tail_bound) & (inputs <= right_tail_bound)
     outside_interval_mask = ~inside_interval_mask
 
     outputs = torch.zeros_like(inputs)
     logabsdet = torch.zeros_like(inputs)
 
-    if tails == "linear":
-        unnormalized_derivatives = F.pad(unnormalized_derivatives, pad=(1, 1))
-        constant = np.log(np.exp(1 - min_derivative) - 1)
-        unnormalized_derivatives[..., 0] = constant
-        unnormalized_derivatives[..., -1] = constant
+    # Both tails are linear, so we add extra derivatives to either side
+    unnormalized_derivatives = F.pad(unnormalized_derivatives, pad=(1, 1))
+    constant = np.log(np.exp(1 - min_derivative) - 1)
+    unnormalized_derivatives[..., 0] = constant
+    unnormalized_derivatives[..., -1] = constant
 
-        outputs[outside_interval_mask] = inputs[outside_interval_mask]
-        logabsdet[outside_interval_mask] = 0
-    else:
-        raise RuntimeError("{} tails are not implemented.".format(tails))
+    outputs[outside_interval_mask] = inputs[outside_interval_mask]
+    logabsdet[outside_interval_mask] = 0
 
-    if torch.any(inside_interval_mask):
-        (
-            outputs[inside_interval_mask],
-            logabsdet[inside_interval_mask],
-        ) = rational_quadratic_spline(
-            inputs=inputs[inside_interval_mask],
-            unnormalized_widths=unnormalized_widths[inside_interval_mask, :],
-            unnormalized_heights=unnormalized_heights[inside_interval_mask, :],
-            unnormalized_derivatives=unnormalized_derivatives[inside_interval_mask, :],
-            inverse=inverse,
-            left=-tail_bound,
-            right=tail_bound,
-            bottom=-tail_bound,
-            top=tail_bound,
-            min_bin_width=min_bin_width,
-            min_bin_height=min_bin_height,
-            min_derivative=min_derivative,
-            enable_identity_init=enable_identity_init,
-        )
+    (
+        outputs[inside_interval_mask],
+        logabsdet[inside_interval_mask],
+    ) = rational_quadratic_spline(
+        inputs=inputs[inside_interval_mask],
+        unnormalized_widths=unnormalized_widths[inside_interval_mask, :],
+        unnormalized_heights=unnormalized_heights[inside_interval_mask, :],
+        unnormalized_derivatives=unnormalized_derivatives[inside_interval_mask, :],
+        inverse=inverse,
+        left=left_tail_bound,
+        right=right_tail_bound,
+        bottom=left_tail_bound,
+        top=right_tail_bound,
+        min_bin_width=min_bin_width,
+        min_bin_height=min_bin_height,
+        min_derivative=min_derivative,
+        enable_identity_init=enable_identity_init,
+    )
 
     return outputs, logabsdet
 
 
+@torch.compile
 def rational_quadratic_spline(
     inputs,
     unnormalized_widths,
@@ -78,7 +77,10 @@ def rational_quadratic_spline(
     min_derivative=DEFAULT_MIN_DERIVATIVE,
     enable_identity_init=False,
 ):
-    if torch.min(inputs) < left or torch.max(inputs) > right:
+    if not inverse and (torch.min(inputs) < left or torch.max(inputs) > right):
+        raise InputOutsideDomain()
+
+    if inverse and (torch.min(inputs) > top or torch.max(inputs) < bottom):
         raise InputOutsideDomain()
 
     num_bins = unnormalized_widths.shape[-1]
@@ -97,9 +99,11 @@ def rational_quadratic_spline(
     cumwidths[..., -1] = right
     widths = cumwidths[..., 1:] - cumwidths[..., :-1]
 
-    if enable_identity_init: #flow is the identity if initialized with parameters equal to zero
+    if (
+        enable_identity_init
+    ):  # flow is the identity if initialized with parameters equal to zero
         beta = np.log(2) / (1 - min_derivative)
-    else: #backward compatibility
+    else:  # backward compatibility
         beta = 1
     derivatives = min_derivative + F.softplus(unnormalized_derivatives, beta=beta)
 
