@@ -14,8 +14,10 @@ from nflows.transforms.splines.quadratic import (
 )
 from nflows.transforms.splines import rational_quadratic
 from nflows.transforms.splines.rational_quadratic import (
-    rational_quadratic_spline,
-    unconstrained_rational_quadratic_spline,
+    forward_rational_quadratic_spline,
+    inverse_rational_quadratic_spline,
+    unconstrained_rational_quadratic_spline_forward,
+    unconstrained_rational_quadratic_spline_inverse,
 )
 from nflows.utils import torchutils
 from nflows.transforms.UMNN import *
@@ -131,17 +133,18 @@ class MaskedAffineAutoregressiveTransform(AutoregressiveTransform):
 class MaskedUMNNAutoregressiveTransform(AutoregressiveTransform):
     """An unconstrained monotonic neural networks autoregressive layer that transforms the variables.
 
-        Reference:
-        > A. Wehenkel and G. Louppe, Unconstrained Monotonic Neural Networks, NeurIPS2019.
+    Reference:
+    > A. Wehenkel and G. Louppe, Unconstrained Monotonic Neural Networks, NeurIPS2019.
 
-        ---- Specific arguments ----
-        integrand_net_layers: the layers dimension to put in the integrand network.
-        cond_size: The embedding size for the conditioning factors.
-        nb_steps: The number of integration steps.
-        solver: The quadrature algorithm - CC or CCParallel. Both implements Clenshaw-Curtis quadrature with
-        Leibniz rule for backward computation. CCParallel pass all the evaluation points (nb_steps) at once, it is faster
-        but requires more memory.
-        """
+    ---- Specific arguments ----
+    integrand_net_layers: the layers dimension to put in the integrand network.
+    cond_size: The embedding size for the conditioning factors.
+    nb_steps: The number of integration steps.
+    solver: The quadrature algorithm - CC or CCParallel. Both implements Clenshaw-Curtis quadrature with
+    Leibniz rule for backward computation. CCParallel pass all the evaluation points (nb_steps) at once, it is faster
+    but requires more memory.
+    """
+
     def __init__(
         self,
         features,
@@ -174,23 +177,29 @@ class MaskedUMNNAutoregressiveTransform(AutoregressiveTransform):
         )
         self._epsilon = 1e-3
         super().__init__(made)
-        self.transformer = MonotonicNormalizer(integrand_net_layers, cond_size, nb_steps, solver)
-
+        self.transformer = MonotonicNormalizer(
+            integrand_net_layers, cond_size, nb_steps, solver
+        )
 
     def _output_dim_multiplier(self):
         return self.cond_size
 
     def _elementwise_forward(self, inputs, autoregressive_params):
-        z, jac = self.transformer(inputs, autoregressive_params.reshape(inputs.shape[0], inputs.shape[1], -1))
+        z, jac = self.transformer(
+            inputs, autoregressive_params.reshape(inputs.shape[0], inputs.shape[1], -1)
+        )
         log_det_jac = jac.log().sum(1)
         return z, log_det_jac
 
     def _elementwise_inverse(self, inputs, autoregressive_params):
-        x = self.transformer.inverse_transform(inputs, autoregressive_params.reshape(inputs.shape[0], inputs.shape[1], -1))
-        z, jac = self.transformer(x, autoregressive_params.reshape(inputs.shape[0], inputs.shape[1], -1))
+        x = self.transformer.inverse_transform(
+            inputs, autoregressive_params.reshape(inputs.shape[0], inputs.shape[1], -1)
+        )
+        z, jac = self.transformer(
+            x, autoregressive_params.reshape(inputs.shape[0], inputs.shape[1], -1)
+        )
         log_det_jac = -jac.log().sum(1)
         return x, log_det_jac
-
 
 
 class MaskedPiecewiseLinearAutoregressiveTransform(AutoregressiveTransform):
@@ -427,6 +436,41 @@ class MaskedPiecewiseRationalQuadraticAutoregressiveTransform(AutoregressiveTran
         self.tails = tails
         self.tail_bound = tail_bound
 
+        if self.tails is None:
+            self.spline_fn = (
+                forward_rational_quadratic_spline,
+                inverse_rational_quadratic_spline,
+            )
+            self.spline_kwargs = {
+                "left": -self.tail_bound,
+                "right": self.tail_bound,
+                "bottom": -self.tail_bound,
+                "top": self.tail_bound,
+            }
+        elif self.tails == "linear":
+            self.spline_fn = (
+                unconstrained_rational_quadratic_spline_forward,
+                unconstrained_rational_quadratic_spline_inverse,
+            )
+            self.spline_kwargs = {
+                "tails": self.tails,
+                "left_tail_bound": -self.tail_bound,
+                "right_tail_bound": self.tail_bound,
+            }
+        elif self.tails == "linear_right":
+            self.spline_fn = (
+                unconstrained_rational_quadratic_spline_forward,
+                unconstrained_rational_quadratic_spline_inverse,
+            )
+            self.spline_kwargs = {
+                "tails": self.tails,
+                "left_tail_bound": 0.0,
+                "right_tail_bound": self.tail_bound,
+            }
+
+        else:
+            raise ValueError
+
         autoregressive_net = made_module.MADE(
             features=features,
             hidden_features=hidden_features,
@@ -445,12 +489,14 @@ class MaskedPiecewiseRationalQuadraticAutoregressiveTransform(AutoregressiveTran
     def _output_dim_multiplier(self):
         if self.tails == "linear":
             return self.num_bins * 3 - 1
+        elif self.tails == "linear_right":
+            return self.num_bins * 3
         elif self.tails is None:
             return self.num_bins * 3 + 1
         else:
             raise ValueError
 
-    def _elementwise(self, inputs, autoregressive_params, inverse=False):
+    def _elementwise_forward(self, inputs, autoregressive_params):
         batch_size, features = inputs.shape[0], inputs.shape[1]
 
         transform_params = autoregressive_params.view(
@@ -465,34 +511,46 @@ class MaskedPiecewiseRationalQuadraticAutoregressiveTransform(AutoregressiveTran
             unnormalized_widths /= np.sqrt(self.autoregressive_net.hidden_features)
             unnormalized_heights /= np.sqrt(self.autoregressive_net.hidden_features)
 
-        if self.tails is None:
-            spline_fn = rational_quadratic_spline
-            spline_kwargs = {}
-        elif self.tails == "linear":
-            spline_fn = unconstrained_rational_quadratic_spline
-            spline_kwargs = {"tails": self.tails, "tail_bound": self.tail_bound}
-        else:
-            raise ValueError
-
-        outputs, logabsdet = spline_fn(
+        outputs, logabsdet = self.spline_fn[0](
             inputs=inputs,
             unnormalized_widths=unnormalized_widths,
             unnormalized_heights=unnormalized_heights,
             unnormalized_derivatives=unnormalized_derivatives,
-            inverse=inverse,
             min_bin_width=self.min_bin_width,
             min_bin_height=self.min_bin_height,
             min_derivative=self.min_derivative,
-            **spline_kwargs
+            **self.spline_kwargs
         )
 
         return outputs, torchutils.sum_except_batch(logabsdet)
 
-    def _elementwise_forward(self, inputs, autoregressive_params):
-        return self._elementwise(inputs, autoregressive_params)
-
     def _elementwise_inverse(self, inputs, autoregressive_params):
-        return self._elementwise(inputs, autoregressive_params, inverse=True)
+        batch_size, features = inputs.shape[0], inputs.shape[1]
+
+        transform_params = autoregressive_params.view(
+            batch_size, features, self._output_dim_multiplier()
+        )
+
+        unnormalized_widths = transform_params[..., : self.num_bins]
+        unnormalized_heights = transform_params[..., self.num_bins : 2 * self.num_bins]
+        unnormalized_derivatives = transform_params[..., 2 * self.num_bins :]
+
+        if hasattr(self.autoregressive_net, "hidden_features"):
+            unnormalized_widths /= np.sqrt(self.autoregressive_net.hidden_features)
+            unnormalized_heights /= np.sqrt(self.autoregressive_net.hidden_features)
+
+        outputs, logabsdet = self.spline_fn[1](
+            inputs=inputs,
+            unnormalized_widths=unnormalized_widths,
+            unnormalized_heights=unnormalized_heights,
+            unnormalized_derivatives=unnormalized_derivatives,
+            min_bin_width=self.min_bin_width,
+            min_bin_height=self.min_bin_height,
+            min_derivative=self.min_derivative,
+            **self.spline_kwargs
+        )
+
+        return outputs, torchutils.sum_except_batch(logabsdet)
 
 
 def main():

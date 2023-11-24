@@ -5,6 +5,8 @@ from nflows.transforms.splines.quadratic import (
     unconstrained_quadratic_spline,
 )
 from nflows.transforms.splines.rational_quadratic import (
-    rational_quadratic_spline,
-    unconstrained_rational_quadratic_spline,
+    forward_rational_quadratic_spline,
+    inverse_rational_quadratic_spline,
+    unconstrained_rational_quadratic_spline_forward,
+    unconstrained_rational_quadratic_spline_inverse,
 )
