@@ -46,14 +46,14 @@ class HouseholderSequence(Transform):
             a = a.repeat(*(repeat_idx))
 
             order_index = torch.Tensor(
-                np.concatenate(
-                    [init_dim * np.arange(n_tile) + i for i in range(init_dim)]
+                torch.concatenate(
+                    [init_dim * torch.arange(n_tile) + i for i in range(init_dim)]
                 )
             ).long()
             return torch.index_select(a, dim, order_index)
 
         qv = tile(torch.eye(num_transforms // 2, features), 0, 2)
-        if np.mod(num_transforms, 2) != 0:  # odd number of transforms, including 1
+        if num_transforms % 2 != 0:  # odd number of transforms, including 1
             qv = torch.cat((qv, torch.zeros(1, features)))
             qv[-1, num_transforms // 2] = 1
         self.q_vectors = nn.Parameter(qv)
@@ -76,7 +76,7 @@ class HouseholderSequence(Transform):
             - A Tensor of shape [N, D], the outputs.
             - A Tensor of shape [N], the log absolute determinants of the total transform.
         """
-        squared_norms = torch.sum(q_vectors ** 2, dim=-1)
+        squared_norms = torch.sum(q_vectors**2, dim=-1)
         outputs = inputs
         for q_vector, squared_norm in zip(q_vectors, squared_norms):
             temp = outputs @ q_vector  # Inner product.
